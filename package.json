@@ -1,6 +1,7 @@
 {
-  "name": "server",
+  "name": "bookread-ai",
   "version": "1.0.0",
+  "description": "BookRead AI Backend Server",
   "main": "server.js",
   "scripts": {
     "start": "cd server && npm start",
@@ -10,16 +11,6 @@
     "install:all": "npm install && cd client && npm install && cd ../server && npm install",
     "build:deploy": "cd client && npm run build && cd ../server && npm start"
   },
-  "keywords": [],
   "author": "",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "axios": "^1.10.0",
-    "cors": "^2.8.5",
-    "dotenv": "^17.2.0",
-    "express": "^5.1.0",
-    "multer": "^2.0.1",
-    "pdf2json": "^3.1.6"
-  }
+  "license": "ISC"
 }
