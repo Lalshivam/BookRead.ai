@@ -1,22 +1,19 @@
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const { extractContextFromPDF } = require('./pdfUtils');
 const axios = require('axios');
-const cors = require('cors');
+const fs = require('fs');
+
 require('dotenv').config();
 
 const app = express();
-
-// Middleware
 app.use(express.json());
-app.use(cors({
+app.use(cors({ 
   origin: ['http://localhost:3000', 'http://localhost:5173', 'http://localhost:5000'],
   credentials: true
 }));
-
-// Serve static files from React build
-app.use(express.static(path.join(__dirname, '../client/dist')));
 
 // Ensure uploads directory exists
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -24,80 +21,63 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Configure multer for file uploads
+// Multer config
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadsDir);
-  },
+  destination: uploadsDir,
   filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF files are allowed!'), false);
-    }
+    cb(null, Date.now() + path.extname(file.originalname));
   },
-  limits: {
-    fileSize: 50 * 1024 * 1024 // 50MB limit
-  }
+});
+const upload = multer({ storage });
+
+// API Routes (must come BEFORE static file serving)
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    message: 'BookRead AI Server is running',
+    timestamp: new Date().toISOString(),
+    hasApiKey: !!process.env.GEMINI_API_KEY
+  });
 });
 
-// API Routes
+// File upload endpoint
 app.post('/api/upload', upload.single('file'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    console.log('File uploaded:', req.file.filename);
-    res.json({ 
-      filePath: `/uploads/${req.file.filename}`,
-      filename: req.file.filename,
-      originalname: req.file.originalname
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'File upload failed' });
-  }
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  console.log('File uploaded:', req.file.filename);
+  res.json({ filePath: `/uploads/${req.file.filename}` });
 });
 
 // Serve uploaded files
 app.use('/uploads', express.static(uploadsDir));
 
-// AI Query endpoint
+// AI query endpoint
 app.post('/api/query', async (req, res) => {
-  try {
-    const { text, prompt, filename, pageNumber = 1 } = req.body;
+  const { text, prompt, filename, pageNumber } = req.body;
 
-    if (!text || !prompt) {
-      return res.status(400).json({ error: 'Text and prompt are required' });
+  if (!text || !prompt) {
+    return res.status(400).json({ error: 'Missing text or prompt' });
+  }
+
+  try {
+    console.log('\n--- AI Query Incoming ---');
+    console.log('Prompt:', prompt);
+    console.log('Selected text length:', text.length);
+
+    // If filename and pageNumber provided, extract context
+    let context = '';
+    if (filename && pageNumber) {
+      try {
+        context = await extractContextFromPDF(filename, parseInt(pageNumber));
+      } catch (contextError) {
+        console.log('Context extraction failed, proceeding without context:', contextError.message);
+      }
     }
 
-    // Create a comprehensive prompt for Gemini
-    const fullPrompt = `
-Context: The user is reading a PDF document${filename ? ` named "${filename}"` : ''} and has selected the following text for analysis:
+    const fullPrompt = `${prompt}\n\nContext:\n${context}\n\nSelected Text:\n${text}`;
 
-Selected Text: "${text}"
-
-User Question: ${prompt}
-
-Please provide a detailed, helpful response that:
-1. Directly addresses the user's question
-2. References the selected text context
-3. Provides clear explanations
-4. Can respond in both English and Hindi if needed
-5. Is educational and informative
-
-Response:`;
-
-    console.log('Full prompt sent to Gemini:\n', fullPrompt);
+    console.log('Querying Gemini AI...');
 
     const response = await axios.post(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent',
@@ -109,54 +89,73 @@ Response:`;
           'Content-Type': 'application/json',
           'x-goog-api-key': process.env.GEMINI_API_KEY,
         },
+        timeout: 30000
       }
     );
 
     const geminiReply =
       response.data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No response from Gemini';
 
+    console.log('Gemini response received successfully');
     res.json({ response: geminiReply });
   } catch (error) {
     console.error('Gemini API error:', error?.response?.data || error.message);
+    if (error.code === 'ECONNABORTED') {
+      return res.status(408).json({ error: 'Request timeout - please try again' });
+    }
     res.status(500).json({ error: 'Failed to query Gemini API' });
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    message: 'BookRead AI Server is running',
-    timestamp: new Date().toISOString()
-  });
-});
+// Serve static files from React build
+const clientBuildPath = path.join(__dirname, '..', 'client', 'dist');
+console.log('Looking for client build at:', clientBuildPath);
 
-// Serve React app for all non-API routes (SPA fallback)
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../client/dist/index.html'));
+if (fs.existsSync(clientBuildPath)) {
+  app.use(express.static(clientBuildPath));
+  console.log('✅ Client build directory found');
+} else {
+  console.log('⚠️ Client build not found. Run: cd client && npm run build');
+}
+
+// FIXED: Replace the problematic catch-all route with specific handling
+app.use((req, res, next) => {
+  // Skip API routes
+  if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) {
+    return next();
+  }
+  
+  // Serve index.html for all other routes (SPA routing)
+  const indexPath = path.join(clientBuildPath, 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(404).json({ 
+      error: 'Client build not found',
+      message: 'Please run: cd client && npm run build'
+    });
+  }
 });
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError) {
-    if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ error: 'File too large. Maximum size is 50MB.' });
-    }
-  }
-  
   console.error('Server Error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+  });
 });
 
 const PORT = process.env.PORT || 5000;
+
 app.listen(PORT, () => {
-  console.log(`🚀 BookRead AI Server running on port ${PORT}`);
-  console.log(`📱 Frontend: http://localhost:${PORT}`);
-  console.log(`🔌 API: http://localhost:${PORT}/api`);
-  console.log(`💚 Health Check: http://localhost:${PORT}/api/health`);
+  console.log('🚀 BookRead AI Server Started Successfully!');
+  console.log(`📊 Port: ${PORT}`);
+  console.log(`🔑 API Key: ${process.env.GEMINI_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
+  console.log(`🌐 Frontend: http://localhost:${PORT}`);
+  console.log(`💚 Health: http://localhost:${PORT}/api/health`);
+  console.log(`📁 Client Build: ${fs.existsSync(clientBuildPath) ? '✅ Found' : '❌ Missing'}`);
 });
-
-
 
 // const express = require('express');
 // const cors = require('cors');
@@ -165,6 +164,7 @@ app.listen(PORT, () => {
 // const { extractContextFromPDF } = require('./pdfUtils');
 // const axios = require('axios');
 // const fs = require('fs');
+
 
 // require('dotenv').config();
 
